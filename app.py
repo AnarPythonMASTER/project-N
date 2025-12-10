@@ -102,13 +102,20 @@ def add_psychro(df: pd.DataFrame) -> pd.DataFrame:
 def _load_single_xlsx_from_gdrive(url: str, label: str) -> pd.DataFrame:
     """
     Download a single XLSX from Google Drive and return a DataFrame.
+    Handles Drive anti-bot protections.
     """
-    resp = requests.get(url)
-    resp.raise_for_status()
+    headers = {"User-Agent": "Mozilla/5.0"}
+    resp = requests.get(url, headers=headers)
+
+    if resp.status_code != 200:
+        st.error(f"Failed to download {label} — HTTP {resp.status_code}")
+        st.stop()
+
     bio = io.BytesIO(resp.content)
     df = pd.read_excel(bio)
     df["source_file"] = label
     return df
+
 
 @st.cache_data(show_spinner=True)
 def load_data_from_drive() -> pd.DataFrame:
