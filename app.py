@@ -1,59 +1,23 @@
+import io
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from pathlib import Path
 import requests
-import os
 
 # ==========================================
-# 1) ENSURE PARQUET DATA EXISTS (GOOGLE DRIVE FALLBACK)
-# ==========================================
-GDRIVE_URL = "https://drive.google.com/uc?export=download&confirm=1&id=1quysauOgFKTcRdxpKITBmMNUXH5L1bDE"
-
-DATA_DIR = Path(__file__).parent / "dataset_cache"
-PARQUET_PATH = DATA_DIR / "cached_dataset.parquet"
-
-
-def ensure_data_exists():
-    """Ensures cached_dataset.parquet exists locally or downloads it."""
-
-    # Create folder safely
-    if not DATA_DIR.exists():
-        try:
-            os.makedirs(DATA_DIR, exist_ok=True)
-        except Exception:
-            pass
-
-    # If file already exists → use cached version
-    if PARQUET_PATH.exists() and PARQUET_PATH.is_file():
-        return PARQUET_PATH
-
-    # Download from Google Drive
-    with st.spinner("Downloading cached dataset (≈56MB) from Google Drive…"):
-        r = requests.get(GDRIVE_URL, stream=True)
-        r.raise_for_status()
-
-        with open(PARQUET_PATH, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-
-    return PARQUET_PATH
-
-
-# ==========================================
-# GLOBAL CONFIG
+# CONFIG
 # ==========================================
 
 RUN_COL = "file_id"
 TIME_COL = "RelativeMinutes"
 
-FEATURE_HUMIDITY = "EOL_CAN.RemoteHumidity.humidity"
-FEATURE_TEMP = "EOL_CAN.RemoteHumidity.temperature"
-FEATURE_ABS_HUMI = "EOL_CAN.RemoteHumidity.absolute_humidity"
-FEATURE_VPD = "EOL_CAN.RemoteHumidity.vpd"
-FEATURE_DEWPOINT = "EOL_CAN.RemoteHumidity.dewpoint_spread"
+FEATURE_HUMIDITY   = "EOL_CAN.RemoteHumidity.humidity"
+FEATURE_TEMP       = "EOL_CAN.RemoteHumidity.temperature"
+FEATURE_ABS_HUMI   = "EOL_CAN.RemoteHumidity.absolute_humidity"
+FEATURE_VPD        = "EOL_CAN.RemoteHumidity.vpd"
+FEATURE_DEWPOINT   = "EOL_CAN.RemoteHumidity.dewpoint_spread"
 
 FEATURES_ALL = [
     FEATURE_HUMIDITY,
@@ -63,6 +27,13 @@ FEATURES_ALL = [
     FEATURE_DEWPOINT,
 ]
 
+# Google Drive export URLs
+GDRIVE_URL_1 = "https://docs.google.com/spreadsheets/d/1ererIr4tgt6EaHh46BkQf55k9c8Akn_7/export?format=xlsx"
+GDRIVE_URL_2 = "https://docs.google.com/spreadsheets/d/1ZsatfTF6pzGVndowHXy_LvwF_VtivgQI/export?format=xlsx"
+
+# ==========================================
+# SMALL SIGNATURE FOR CACHING
+# ==========================================
 
 def df_signature(df: pd.DataFrame):
     """
@@ -75,36 +46,30 @@ def df_signature(df: pd.DataFrame):
         tuple(df.columns),
     )
 
-
 # ==========================================
-# PSYCHROMETRIC HELPERS (kept for safety)
+# PSYCHROMETRIC HELPERS
 # ==========================================
 
 A, B = 17.62, 243.12
 
-
 def es_hpa(Tc):
     return 6.112 * np.exp((A * Tc) / (B + Tc))
 
-
 def dewpoint_c(Tc, RH):
     RHc = np.clip(RH, 1e-6, 100.0)
-    gamma = (A * Tc) / (B + Tc) + np.log(RHc / 100.0)
+    gamma = (A * Tc)/(B + Tc) + np.log(RHc / 100.0)
     return (B * gamma) / (A - gamma)
-
 
 def vpd_hpa(Tc, RH):
     es = es_hpa(Tc)
-    e = (np.clip(RH, 0, 100) / 100) * es
+    e = (np.clip(RH,0,100)/100) * es
     return es - e
-
 
 def absolute_humidity_gm3(Tc, RH):
     es = es_hpa(Tc)
-    e = (np.clip(RH, 0, 100) / 100) * es
+    e = (np.clip(RH,0,100)/100) * es
     Tk = Tc + 273.15
     return 216.7 * (e / Tk)
-
 
 HUMI_CHANNELS = [
     {
@@ -114,33 +79,72 @@ HUMI_CHANNELS = [
     }
 ]
 
-
 def add_psychro(df: pd.DataFrame) -> pd.DataFrame:
-    """Only used if parquet does NOT already contain these columns."""
-    frames = []
+    """
+    Ensure psychrometric columns exist.
+    We overwrite / create in-place (no duplicate columns).
+    """
     for ch in HUMI_CHANNELS:
         if ch["t"] in df.columns and ch["rh"] in df.columns:
             T = pd.to_numeric(df[ch["t"]], errors="coerce")
             RH = pd.to_numeric(df[ch["rh"]], errors="coerce")
             base = ch["name"]
 
-            frames.append(
-                pd.DataFrame(
-                    {
-                        f"{base}.dewpoint_spread": T - dewpoint_c(T, RH),
-                        f"{base}.absolute_humidity": absolute_humidity_gm3(T, RH),
-                        f"{base}.vpd": vpd_hpa(T, RH),
-                    }
-                )
-            )
-    if frames:
-        extra = pd.concat(frames, axis=1)
-        # avoid duplicate columns if parquet already has them
-        for col in extra.columns:
-            if col not in df.columns:
-                df[col] = extra[col]
+            df[f"{base}.dewpoint_spread"]   = T - dewpoint_c(T, RH)
+            df[f"{base}.absolute_humidity"] = absolute_humidity_gm3(T, RH)
+            df[f"{base}.vpd"]               = vpd_hpa(T, RH)
     return df
 
+# ==========================================
+# DATA LOADING FROM GOOGLE DRIVE
+# ==========================================
+
+def _load_single_xlsx_from_gdrive(url: str, label: str) -> pd.DataFrame:
+    """
+    Download a single XLSX from Google Drive and return a DataFrame.
+    """
+    resp = requests.get(url)
+    resp.raise_for_status()
+    bio = io.BytesIO(resp.content)
+    df = pd.read_excel(bio)
+    df["source_file"] = label
+    return df
+
+@st.cache_data(show_spinner=True)
+def load_data_from_drive() -> pd.DataFrame:
+    """
+    Load merged_all1.xlsx and merged_all2.xlsx from Google Drive,
+    stack them together, add psychro metrics, and ensure RelativeMinutes.
+    """
+    st.info("Downloading merged_all1.xlsx and merged_all2.xlsx from Google Drive...")
+
+    df1 = _load_single_xlsx_from_gdrive(GDRIVE_URL_1, "merged_all1.xlsx")
+    df2 = _load_single_xlsx_from_gdrive(GDRIVE_URL_2, "merged_all2.xlsx")
+
+    data_all = pd.concat([df1, df2], ignore_index=True)
+
+    # Ensure psychrometric fields
+    data_all = add_psychro(data_all)
+
+    # Ensure RUN_COL exists
+    if RUN_COL not in data_all.columns:
+        # fallback: run id from source_file groups
+        st.warning("Column 'file_id' missing — generating synthetic IDs from source_file.")
+        data_all[RUN_COL] = data_all.groupby("source_file").ngroup()
+
+    # Ensure TIME_COL exists
+    if TIME_COL not in data_all.columns:
+        ts = "EOL_CAN.teststandTimestamp_millis"
+        if ts in data_all.columns:
+            st.info("Computing RelativeMinutes from EOL_CAN.teststandTimestamp_millis...")
+            data_all["MinMillis"] = data_all.groupby(RUN_COL)[ts].transform("min")
+            data_all["RelativeMillis"] = data_all[ts] - data_all["MinMillis"]
+            data_all[TIME_COL] = data_all["RelativeMillis"] / 60000.0
+        else:
+            st.warning("No RelativeMinutes or timestamp column found — using 0 for all.")
+            data_all[TIME_COL] = 0.0
+
+    return data_all
 
 # ==========================================
 # ALIGNMENT HELPERS (base functions)
@@ -156,7 +160,6 @@ def compute_monotonicity_for_feature(df, feat, run_col, time_col):
         return "up"
     return "down"
 
-
 def compute_coverage(min_series, max_series, step=0.1):
     mn = min_series.min()
     mx = max_series.max()
@@ -166,13 +169,11 @@ def compute_coverage(min_series, max_series, step=0.1):
         coverage[(bins >= lo) & (bins <= hi)] += 1
     return bins, coverage
 
-
 def compute_alignment_value(bins, coverage):
     if len(coverage) == 0:
         return None, 0
     idx = int(np.argmax(coverage))
     return float(bins[idx]), int(coverage[idx])
-
 
 def compute_consensus_interval(bins, coverage, pct=0.9):
     if len(coverage) == 0:
@@ -184,31 +185,24 @@ def compute_consensus_interval(bins, coverage, pct=0.9):
     i = np.where(mask)[0]
     return float(bins[i[0]]), float(bins[i[-1]])
 
-
 def compute_crossing_time_single_run(t, v, align_value, monotonicity):
-    for i in range(len(t) - 1):
+    for i in range(len(t)-1):
         if monotonicity == "down":
-            if v[i] > align_value and v[i + 1] <= align_value:
-                if v[i] == v[i + 1]:
+            if v[i] > align_value and v[i+1] <= align_value:
+                if v[i] == v[i+1]:
                     return t[i]
-                frac = (v[i] - align_value) / (v[i] - v[i + 1])
-                return t[i] + frac * (t[i + 1] - t[i])
+                frac = (v[i] - align_value) / (v[i] - v[i+1])
+                return t[i] + frac * (t[i+1] - t[i])
         else:
-            if v[i] < align_value and v[i + 1] >= align_value:
-                if v[i] == v[i + 1]:
+            if v[i] < align_value and v[i+1] >= align_value:
+                if v[i] == v[i+1]:
                     return t[i]
-                frac = (align_value - v[i]) / (v[i + 1] - v[i])
-                return t[i] + frac * (t[i + 1] - t[i])
+                frac = (align_value - v[i]) / (v[i+1] - v[i])
+                return t[i] + frac * (t[i+1] - t[i])
     return np.nan
-
 
 def smooth_series(values, w):
     return pd.Series(values).rolling(w, center=True, min_periods=1).mean().to_numpy()
-
-
-# ==========================================
-# ALIGNMENT ENGINE (same as your working version)
-# ==========================================
 
 def align_multi_feature(
     df,
@@ -337,9 +331,8 @@ def align_multi_feature(
 
     return binned, meta
 
-
 # ==========================================
-# CACHED WRAPPERS (same pattern as your local app)
+# CACHED WRAPPERS (use df_signature)
 # ==========================================
 
 @st.cache_data(show_spinner=False)
@@ -352,7 +345,6 @@ def cached_raw_binning(df_sig, df_sel, selected_features, bin_minutes):
               .agg(agg)
               .rename(columns={"_bin": "BinnedMinutes"})
     )
-
 
 @st.cache_data(show_spinner=False)
 def cached_alignment(df_sig, df, align_feature, time_threshold,
@@ -367,7 +359,6 @@ def cached_alignment(df_sig, df, align_feature, time_threshold,
         bin_minutes=bin_minutes,
         align_value_manual=manual_align,
     )
-
 
 # ==========================================
 # RAW VIEW RENDERER
@@ -501,7 +492,6 @@ def render_raw_view(df: pd.DataFrame):
 
     st.plotly_chart(fig, use_container_width=True)
 
-
 # ==========================================
 # ALIGNED VIEW RENDERER
 # ==========================================
@@ -628,7 +618,6 @@ def render_aligned_view(df: pd.DataFrame):
 
     fig = go.Figure()
 
-    # Raw aligned lines
     for fid, g in df_plot.groupby(RUN_COL):
         x = g["AlignedMinutes"].to_numpy()
         for feat in selected_features:
@@ -645,7 +634,6 @@ def render_aligned_view(df: pd.DataFrame):
                 legendgroup=feat
             ))
 
-    # Median + IQR band
     for feat in selected_features:
         grp = df_plot.groupby("AlignedMinutes")[feat]
         xs = grp.mean().index.to_numpy()
@@ -689,7 +677,6 @@ def render_aligned_view(df: pd.DataFrame):
 
     st.plotly_chart(fig, use_container_width=True)
 
-
 # ==========================================
 # MAIN
 # ==========================================
@@ -698,35 +685,12 @@ def main():
     st.set_page_config(page_title="Humidity / Temperature Alignment App", layout="wide")
 
     st.sidebar.title("App Controls")
-    st.sidebar.markdown("Dataset is loaded from Google Drive (cached as Parquet).")
+    st.sidebar.markdown("Data source: Google Drive (merged_all1 & merged_all2)")
 
-    # Ensure dataset exists (download if needed)
-    parquet_file = ensure_data_exists()
+    with st.spinner("Loading data from Google Drive..."):
+        df = load_data_from_drive()
 
-    with st.spinner("Loading dataset…"):
-        df = pd.read_parquet(parquet_file)
-
-    # Safety: if psychro columns missing (older parquet or future reuse)
-    if not {FEATURE_ABS_HUMI, FEATURE_VPD, FEATURE_DEWPOINT}.issubset(df.columns):
-        df = add_psychro(df)
-
-    # SAFETY: ensure RUN_COL and TIME_COL exist
-    if RUN_COL not in df.columns:
-        st.warning("⚠ 'file_id' column missing — generating synthetic IDs.")
-        df[RUN_COL] = df.groupby(df.index // 1000).ngroup()
-
-    if TIME_COL not in df.columns:
-        ts = "EOL_CAN.teststandTimestamp_millis"
-        if ts in df.columns:
-            st.info("Computing RelativeMinutes from timestamp column…")
-            df["MinMillis"] = df.groupby(RUN_COL)[ts].transform("min")
-            df["RelativeMillis"] = df[ts] - df["MinMillis"]
-            df["RelativeMinutes"] = df["RelativeMillis"] / 60000
-        else:
-            st.warning("⚠ No timestamp column — setting RelativeMinutes = 0.")
-            df["RelativeMinutes"] = 0.0
-
-    st.sidebar.success(f"Loaded {len(df):,} rows · {df[RUN_COL].nunique()} runs")
+    st.sidebar.success(f"Loaded {len(df)} rows, {df[RUN_COL].nunique()} runs.")
 
     view_mode = st.sidebar.radio("View mode", ["Raw Viewer", "Aligned Viewer"])
 
@@ -734,7 +698,6 @@ def main():
         render_raw_view(df)
     else:
         render_aligned_view(df)
-
 
 if __name__ == "__main__":
     main()
