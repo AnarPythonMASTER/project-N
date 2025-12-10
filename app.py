@@ -1,10 +1,9 @@
-import io
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from pathlib import Path
-import requests
+
 
 # ==========================================
 # CONFIG
@@ -27,9 +26,6 @@ FEATURES_ALL = [
     FEATURE_DEWPOINT,
 ]
 
-# Google Drive export URLs
-GDRIVE_URL_1 = "https://docs.google.com/spreadsheets/d/1ererIr4tgt6EaHh46BkQf55k9c8Akn_7/export?format=xlsx"
-GDRIVE_URL_2 = "https://docs.google.com/spreadsheets/d/1ZsatfTF6pzGVndowHXy_LvwF_VtivgQI/export?format=xlsx"
 
 # ==========================================
 # SMALL SIGNATURE FOR CACHING
@@ -45,6 +41,7 @@ def df_signature(df: pd.DataFrame):
         df[RUN_COL].nunique() if RUN_COL in df.columns else 0,
         tuple(df.columns),
     )
+
 
 # ==========================================
 # PSYCHROMETRIC HELPERS
@@ -80,60 +77,99 @@ HUMI_CHANNELS = [
 ]
 
 def add_psychro(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ensure psychrometric columns exist.
-    We overwrite / create in-place (no duplicate columns).
-    """
+    frames = []
     for ch in HUMI_CHANNELS:
         if ch["t"] in df.columns and ch["rh"] in df.columns:
             T = pd.to_numeric(df[ch["t"]], errors="coerce")
             RH = pd.to_numeric(df[ch["rh"]], errors="coerce")
             base = ch["name"]
 
-            df[f"{base}.dewpoint_spread"]   = T - dewpoint_c(T, RH)
-            df[f"{base}.absolute_humidity"] = absolute_humidity_gm3(T, RH)
-            df[f"{base}.vpd"]               = vpd_hpa(T, RH)
+            frames.append(pd.DataFrame({
+                f"{base}.dewpoint_spread": T - dewpoint_c(T, RH),
+                f"{base}.absolute_humidity": absolute_humidity_gm3(T, RH),
+                f"{base}.vpd": vpd_hpa(T, RH),
+            }))
+    if frames:
+        df = pd.concat([df] + frames, axis=1)
     return df
+
 
 # ==========================================
-# DATA LOADING FROM GOOGLE DRIVE
+# DATA LOADING  (XLSX → Parquet cache)
 # ==========================================
 
-import requests
-import io
-import pandas as pd
+@st.cache_data(show_spinner=False)
+def load_data_from_folder(data_dir: Path) -> pd.DataFrame:
+    """
+    Loads all XLSX files OR returns cached Parquet if it exists.
+    Extremely fast on re-load.
+    """
 
-def download_big_gdrive_file(file_id, filename):
-    URL = "https://drive.google.com/uc?export=download"
+    parquet_path = data_dir / "cached_dataset.parquet"
+    hash_path    = data_dir / "file_hash.txt"
 
-    session = requests.Session()
+    # -----------------------------------------------------------
+    # 1. If Parquet + hash exist → load instantly
+    # -----------------------------------------------------------
+    if parquet_path.exists() and hash_path.exists():
+        stored_hash = hash_path.read_text().strip()
 
-    response = session.get(URL, params={'id': file_id}, stream=True)
-    token = None
+        files = sorted(data_dir.glob("*.xlsx"))
+        file_names = ",".join([f"{f.name}-{f.stat().st_mtime}" for f in files])
+        current_hash = str(abs(hash(file_names)))
 
-    # Look for confirmation token
-    for key, value in response.cookies.items():
-        if key.startswith('download_warning'):
-            token = value
-            break
+        if stored_hash == current_hash:
+            # Load Parquet instantly
+            return pd.read_parquet(parquet_path)
 
-    if token:
-        response = session.get(URL, params={'id': file_id, 'confirm': token}, stream=True)
+    # -----------------------------------------------------------
+    # 2. ELSE: compute from XLSX and store cache
+    # -----------------------------------------------------------
+    files = sorted(data_dir.glob("*.xlsx"))
+    if not files:
+        raise FileNotFoundError(f"No .xlsx files found in {data_dir}")
 
-    # Write content into memory
-    file_bytes = io.BytesIO(response.content)
-    df = pd.read_excel(file_bytes)
-    df["source_file"] = filename
-    return df
+    total_files = len(files)
 
+    progress = st.progress(0)
+    status = st.empty()
 
+    dfs = []
 
-@st.cache_data(show_spinner=True)
-def load_data_from_drive():
-    df1 = download_big_gdrive_file("1ererIr4tgt6EaHh46BkQf55k9c8Akn_7", "merged_all1.xlsx")
-    df2 = download_big_gdrive_file("1ZsatfTF6pzGVndowHXy_LvwF_VtivgQI", "merged_all2.xlsx")
-    df = pd.concat([df1, df2], ignore_index=True)
-    return df
+    for i, f in enumerate(files, start=1):
+        status.write(f"📄 Loading file {i} of {total_files}: **{f.name}**")
+        df = pd.read_excel(f)
+        df["source_file"] = f.name
+        dfs.append(df)
+        progress.progress(i / total_files)
+
+    status.write("🧮 Computing psychrometric metrics...")
+    data_all = pd.concat(dfs, ignore_index=True)
+    data_all = add_psychro(data_all)
+    progress.progress(0.85)
+
+    status.write("⏱️ Building RelativeMinutes...")
+    ts = "EOL_CAN.teststandTimestamp_millis"
+    if ts not in data_all.columns:
+        raise KeyError(f"Column {ts} not found in data!")
+
+    data_all["MinMillis"] = data_all.groupby(RUN_COL)[ts].transform("min")
+    data_all["RelativeMillis"] = data_all[ts] - data_all["MinMillis"]
+    data_all["RelativeMinutes"] = data_all["RelativeMillis"] / 60000
+    progress.progress(0.95)
+
+    status.write("💾 Saving Parquet cache...")
+
+    data_all.to_parquet(parquet_path, index=False)
+
+    file_names = ",".join([f"{f.name}-{f.stat().st_mtime}" for f in files])
+    current_hash = str(abs(hash(file_names)))
+    hash_path.write_text(current_hash)
+
+    progress.progress(1.0)
+    status.write("✅ Cached & ready!")
+
+    return data_all
 
 
 # ==========================================
@@ -321,6 +357,7 @@ def align_multi_feature(
 
     return binned, meta
 
+
 # ==========================================
 # CACHED WRAPPERS (use df_signature)
 # ==========================================
@@ -349,6 +386,7 @@ def cached_alignment(df_sig, df, align_feature, time_threshold,
         bin_minutes=bin_minutes,
         align_value_manual=manual_align,
     )
+
 
 # ==========================================
 # RAW VIEW RENDERER
@@ -481,6 +519,7 @@ def render_raw_view(df: pd.DataFrame):
     )
 
     st.plotly_chart(fig, use_container_width=True)
+
 
 # ==========================================
 # ALIGNED VIEW RENDERER
@@ -667,6 +706,7 @@ def render_aligned_view(df: pd.DataFrame):
 
     st.plotly_chart(fig, use_container_width=True)
 
+
 # ==========================================
 # MAIN
 # ==========================================
@@ -675,10 +715,15 @@ def main():
     st.set_page_config(page_title="Humidity / Temperature Alignment App", layout="wide")
 
     st.sidebar.title("App Controls")
-    st.sidebar.markdown("Data source: Google Drive (merged_all1 & merged_all2)")
+    st.sidebar.markdown("Data folder: `./data`")
 
-    with st.spinner("Loading data from Google Drive..."):
-        df = load_data_from_drive()
+    data_dir = Path(__file__).parent / "data"
+    if not data_dir.exists():
+        st.error(f"`data` folder not found next to app.py.\nCreate `{data_dir}` and put your .xlsx files there.")
+        return
+
+    with st.spinner("Loading data..."):
+        df = load_data_from_folder(data_dir)
 
     st.sidebar.success(f"Loaded {len(df)} rows, {df[RUN_COL].nunique()} runs.")
 
@@ -688,6 +733,7 @@ def main():
         render_raw_view(df)
     else:
         render_aligned_view(df)
+
 
 if __name__ == "__main__":
     main()
