@@ -99,59 +99,42 @@ def add_psychro(df: pd.DataFrame) -> pd.DataFrame:
 # DATA LOADING FROM GOOGLE DRIVE
 # ==========================================
 
-def _load_single_xlsx_from_gdrive(url: str, label: str) -> pd.DataFrame:
-    """
-    Download a single XLSX from Google Drive and return a DataFrame.
-    Handles Drive anti-bot protections.
-    """
-    headers = {"User-Agent": "Mozilla/5.0"}
-    resp = requests.get(url, headers=headers)
+import requests
+import io
+import pandas as pd
 
-    if resp.status_code != 200:
-        st.error(f"Failed to download {label} — HTTP {resp.status_code}")
-        st.stop()
+def download_big_gdrive_file(file_id, filename):
+    URL = "https://drive.google.com/uc?export=download"
 
-    bio = io.BytesIO(resp.content)
-    df = pd.read_excel(bio)
-    df["source_file"] = label
+    session = requests.Session()
+
+    response = session.get(URL, params={'id': file_id}, stream=True)
+    token = None
+
+    # Look for confirmation token
+    for key, value in response.cookies.items():
+        if key.startswith('download_warning'):
+            token = value
+            break
+
+    if token:
+        response = session.get(URL, params={'id': file_id, 'confirm': token}, stream=True)
+
+    # Write content into memory
+    file_bytes = io.BytesIO(response.content)
+    df = pd.read_excel(file_bytes)
+    df["source_file"] = filename
     return df
 
 
+
 @st.cache_data(show_spinner=True)
-def load_data_from_drive() -> pd.DataFrame:
-    """
-    Load merged_all1.xlsx and merged_all2.xlsx from Google Drive,
-    stack them together, add psychro metrics, and ensure RelativeMinutes.
-    """
-    st.info("Downloading merged_all1.xlsx and merged_all2.xlsx from Google Drive...")
+def load_data_from_drive():
+    df1 = download_big_gdrive_file("1ererIr4tgt6EaHh46BkQf55k9c8Akn_7", "merged_all1.xlsx")
+    df2 = download_big_gdrive_file("1ZsatfTF6pzGVndowHXy_LvwF_VtivgQI", "merged_all2.xlsx")
+    df = pd.concat([df1, df2], ignore_index=True)
+    return df
 
-    df1 = _load_single_xlsx_from_gdrive(GDRIVE_URL_1, "merged_all1.xlsx")
-    df2 = _load_single_xlsx_from_gdrive(GDRIVE_URL_2, "merged_all2.xlsx")
-
-    data_all = pd.concat([df1, df2], ignore_index=True)
-
-    # Ensure psychrometric fields
-    data_all = add_psychro(data_all)
-
-    # Ensure RUN_COL exists
-    if RUN_COL not in data_all.columns:
-        # fallback: run id from source_file groups
-        st.warning("Column 'file_id' missing — generating synthetic IDs from source_file.")
-        data_all[RUN_COL] = data_all.groupby("source_file").ngroup()
-
-    # Ensure TIME_COL exists
-    if TIME_COL not in data_all.columns:
-        ts = "EOL_CAN.teststandTimestamp_millis"
-        if ts in data_all.columns:
-            st.info("Computing RelativeMinutes from EOL_CAN.teststandTimestamp_millis...")
-            data_all["MinMillis"] = data_all.groupby(RUN_COL)[ts].transform("min")
-            data_all["RelativeMillis"] = data_all[ts] - data_all["MinMillis"]
-            data_all[TIME_COL] = data_all["RelativeMillis"] / 60000.0
-        else:
-            st.warning("No RelativeMinutes or timestamp column found — using 0 for all.")
-            data_all[TIME_COL] = 0.0
-
-    return data_all
 
 # ==========================================
 # ALIGNMENT HELPERS (base functions)
